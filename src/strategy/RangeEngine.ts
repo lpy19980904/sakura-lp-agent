@@ -1,3 +1,5 @@
+import { StateManager } from "./StateManager.js";
+
 export interface TickRange {
   tickLower: number;
   tickUpper: number;
@@ -23,17 +25,32 @@ export class RangeEngine {
 
   /**
    * Compute a new symmetric range centered on `currentTick`.
+   *
+   * The effective half-width is:
+   *   baseWidth * effectiveSpread * tickSpacing
+   *
+   * - When AI is OFF, `effectiveSpread` = 1.0 (fallback)
+   * - When AI is ON,  `effectiveSpread` comes from the last Gemini suggestion
+   *
    * @param currentTick – live tick from slot0
-   * @param width – half-width in tick-spacing multiples (default 10)
-   * @returns new TickRange aligned to tickSpacing
+   * @param baseWidth   – base half-width in tick-spacing multiples (default 10)
    */
-  computeNewRange(currentTick: number, width = 10): TickRange {
+  computeNewRange(currentTick: number, baseWidth = 10): TickRange {
+    const spread = StateManager.effectiveSpread;
     const aligned = this.alignTick(currentTick);
-    const halfSpan = width * this.tickSpacing;
-    return {
+    const halfSpan = Math.round(baseWidth * spread) * this.tickSpacing;
+
+    const range: TickRange = {
       tickLower: aligned - halfSpan,
       tickUpper: aligned + halfSpan,
     };
+
+    const source = StateManager.isAIEngineActive ? "AI" : "fallback";
+    console.log(
+      `[RangeEngine] spread=${spread.toFixed(2)} (${source}) → halfSpan=${halfSpan} ticks`,
+    );
+
+    return range;
   }
 
   /** Update the engine's active range after a successful rebalance. */

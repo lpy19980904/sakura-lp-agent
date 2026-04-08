@@ -15,6 +15,7 @@ function requireEnv(name: string): string {
 
 export const BSC_RPC_URL = requireEnv("BSC_RPC_URL");
 export const PRIVATE_KEY = requireEnv("PRIVATE_KEY") as `0x${string}`;
+export const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
 
 // ---------------------------------------------------------------------------
 // Chain

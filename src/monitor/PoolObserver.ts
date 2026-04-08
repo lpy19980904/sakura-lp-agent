@@ -4,7 +4,10 @@ import { poolAbi } from "../abi/NonfungiblePositionManager.js";
 export interface Slot0Snapshot {
   sqrtPriceX96: bigint;
   tick: number;
+  /** token1 per token0 (raw pool direction). */
   price: number;
+  /** token0 per token1 (inverted — useful when token1 is the "base" asset). */
+  priceInverted: number;
 }
 
 export class PoolObserver {
@@ -33,7 +36,8 @@ export class PoolObserver {
       this.token1Decimals,
     );
 
-    return { sqrtPriceX96, tick, price };
+    const priceInverted = price > 0 ? 1 / price : 0;
+    return { sqrtPriceX96, tick, price, priceInverted };
   }
 
   /** Begin polling slot0 at the given interval. */
