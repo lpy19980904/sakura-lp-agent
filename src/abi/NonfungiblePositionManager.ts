@@ -1,4 +1,4 @@
-// Minimal ABI fragments for PancakeSwap V3 NonfungiblePositionManager.
+// Minimal ABI fragments for Uniswap V3 NonfungiblePositionManager.
 // Typed as `const` so viem can infer argument / return types at compile time.
 
 export const nonfungiblePositionManagerAbi = [

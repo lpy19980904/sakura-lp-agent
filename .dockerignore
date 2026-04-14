@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+*.log
+active_session.json
+scripts
+.git
+.gitignore
+.dockerignore
+README.md

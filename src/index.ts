@@ -16,6 +16,8 @@ import {
   TOKENS,
   POLL_INTERVAL_MS,
   DEFAULT_RANGE_WIDTH,
+  POSITION_ID,
+  setPositionId,
 } from "./config/index.js";
 import { PoolObserver, type Slot0Snapshot } from "./monitor/PoolObserver.js";
 import { RangeEngine } from "./strategy/RangeEngine.js";
@@ -25,20 +27,25 @@ import { Rebalancer } from "./executor/Rebalancer.js";
 import { Swapper } from "./executor/Swapper.js";
 import { nonfungiblePositionManagerAbi } from "./abi/NonfungiblePositionManager.js";
 import { getTokenBalance, ensureApproval } from "./utils/tokens.js";
+import {
+  sendRebalanceReport,
+  sendAlert,
+  sendShutdownNotice,
+  isNotifierEnabled,
+} from "./services/notifier.js";
+import { writeSession, clearSession } from "./utils/logger.js";
 
 // ---------------------------------------------------------------------------
 // Configuration — edit these for the target pool / position
 // ---------------------------------------------------------------------------
 
-/** WBNB / USDT 0.25 % pool on PancakeSwap V3 (BSC). */
-const TARGET_POOL: Address = "0x36696169C63e42cd08ce11f5deeBbCeBae652050";
-const TICK_SPACING = 50;
-const FEE_TIER = 2500;
+/** GENIUS / USDT 0.3 % pool on Uniswap V3 (BSC). */
+const TARGET_POOL: Address = "0xD77865e605049Bb362E9a6C5a1df7b033C376811";
+const TICK_SPACING = 60;
+const FEE_TIER = 3000;
 
-let POSITION_ID: bigint | null = null;
-
-const TOKEN0: Address = TOKENS.USDT;
-const TOKEN1: Address = TOKENS.WBNB;
+const TOKEN0: Address = "0x1F12B85aAC097E43Aa1555b2881E98a51090e9A6"; // GENIUS
+const TOKEN1: Address = TOKENS.USDT;
 
 // ---------------------------------------------------------------------------
 // Clients
@@ -85,7 +92,6 @@ function buildVolatilityData(currentPrice: number): VolatilityData {
   const high24h = Math.max(...prices);
   const low24h = Math.min(...prices);
 
-  // Simple ATR proxy: average of |close(i) - close(i-1)| over the window
   let atrSum = 0;
   for (let i = 1; i < prices.length; i++) {
     atrSum += Math.abs(prices[i] - prices[i - 1]);
@@ -94,35 +100,19 @@ function buildVolatilityData(currentPrice: number): VolatilityData {
   const volatilityPct =
     currentPrice > 0 ? ((high24h - low24h) / currentPrice) * 100 : 0;
 
-  return { high24h, low24h, currentPrice, atr, volatilityPct };
+  return {
+    pairLabel: `${sym0}/${sym1}`,
+    high24h,
+    low24h,
+    currentPrice,
+    atr,
+    volatilityPct,
+    sampleCount: prices.length,
+  };
 }
 
-// ---------------------------------------------------------------------------
-// Periodic AI cron (runs every ~5 min if enabled)
-// ---------------------------------------------------------------------------
-
-const AI_CRON_INTERVAL_MS = 5 * 60 * 1000;
-let aiCronTimer: ReturnType<typeof setInterval> | null = null;
-
-async function aiCronJob(currentPrice: number): Promise<void> {
-  const data = buildVolatilityData(currentPrice);
-  await analyzeVolatilityAndDecide(data);
-}
-
-function startAICron(getCurrentPrice: () => number): void {
-  if (aiCronTimer) return;
-  aiCronTimer = setInterval(
-    () => void aiCronJob(getCurrentPrice()),
-    AI_CRON_INTERVAL_MS,
-  );
-}
-
-function stopAICron(): void {
-  if (aiCronTimer) {
-    clearInterval(aiCronTimer);
-    aiCronTimer = null;
-  }
-}
+/** Cooldown: no rebalance attempts until this timestamp. */
+let rebalanceCooldownUntil = 0;
 
 // ---------------------------------------------------------------------------
 // Terminal hotkey listener (T to toggle AI)
@@ -149,15 +139,12 @@ function setupHotkeyListener(): void {
 
       if (nowActive) {
         console.log(
-          "\x1b[36m\n🧠 AI Brain Engaged. Next cron job will fetch LLM strategy.\x1b[0m",
+          "\x1b[36m\n🧠 AI Brain Engaged. Gemini will be consulted on next rebalance.\x1b[0m",
         );
-        startAICron(() => latestPrice);
-        void aiCronJob(latestPrice);
       } else {
         console.log(
           "\x1b[33m\n⚠️  AI Brain Disabled. Using fallback spread.\x1b[0m",
         );
-        stopAICron();
       }
     }
   });
@@ -172,19 +159,36 @@ async function preflight(): Promise<void> {
     getTokenBalance(publicClient, TOKEN0, account.address),
     getTokenBalance(publicClient, TOKEN1, account.address),
   ]);
-  console.log(`balances : ${bal0.formatted} ${bal0.symbol} / ${bal1.formatted} ${bal1.symbol}`);
+  sym0 = bal0.symbol;
+  sym1 = bal1.symbol;
+  console.log(`pair     : ${sym0}/${sym1}`);
+  console.log(`balances : ${bal0.formatted} ${sym0} / ${bal1.formatted} ${sym1}`);
 
   if (POSITION_ID == null) {
     console.log("mode     : DRY-RUN (no POSITION_ID — rebalance will be simulated)");
   } else {
     console.log(`position : #${POSITION_ID}`);
+
+    const position = await publicClient.readContract({
+      address: CONTRACTS.nonfungiblePositionManager,
+      abi: nonfungiblePositionManagerAbi,
+      functionName: "positions",
+      args: [POSITION_ID],
+    });
+    const posTickLower = position[5];
+    const posTickUpper = position[6];
+    const posLiquidity = position[7];
+    engine.updateRange({ tickLower: posTickLower, tickUpper: posTickUpper });
+    console.log(`on-chain : [${posTickLower}, ${posTickUpper}) liq=${posLiquidity}`);
+
     const pm = CONTRACTS.nonfungiblePositionManager;
     await ensureApproval(publicClient, walletClient, TOKEN0, pm);
     await ensureApproval(publicClient, walletClient, TOKEN1, pm);
     console.log("approvals: OK");
   }
 
-  console.log(`AI brain : OFF (press T to toggle)\n`);
+  console.log(`AI brain : ${StateManager.isAIEngineActive ? "ON" : "OFF"} (press T to toggle — runs on rebalance only)`);
+  console.log(`telegram : ${isNotifierEnabled() ? "ON" : "OFF (set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID)"}\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,16 +196,42 @@ async function preflight(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 let rebalancing = false;
+let shuttingDown = false;
 let latestPrice = 0;
+let sym0 = "TOKEN0";
+let sym1 = "TOKEN1";
+
+/** Extract the most useful parts from viem / generic errors for Telegram. */
+function extractErrorSummary(err: unknown): string {
+  if (!(err instanceof Error)) return String(err).slice(0, 1500);
+
+  const name = err.constructor.name;
+  const record = err as unknown as Record<string, unknown>;
+  const short = record.shortMessage;
+  const details = record.details;
+
+  const parts: string[] = [name];
+  if (typeof short === "string") {
+    parts.push(short);
+  } else {
+    parts.push(err.message.slice(0, 600));
+  }
+  if (typeof details === "string") {
+    parts.push(`Details: ${details}`);
+  }
+  return parts.join("\n").slice(0, 1500);
+}
 
 async function onTick(snapshot: Slot0Snapshot): Promise<void> {
+  if (shuttingDown) return;
+
   const { tick, price, priceInverted } = snapshot;
   latestPrice = priceInverted;
   recordPrice(priceInverted);
 
   const spreadLabel = StateManager.isAIEngineActive ? "AI" : "fixed";
   console.log(
-    `[tick=${tick}] BNB/USDT=${priceInverted.toFixed(2)} | spread=${StateManager.effectiveSpread.toFixed(2)}(${spreadLabel}) | range=[${engine.tickLower}, ${engine.tickUpper})`,
+    `[tick=${tick}] ${sym0}/${sym1}=${priceInverted.toFixed(4)} | spread=${StateManager.effectiveSpread.toFixed(2)}(${spreadLabel}) | range=[${engine.tickLower}, ${engine.tickUpper})`,
   );
 
   if (engine.tickLower === 0 && engine.tickUpper === 0) {
@@ -215,14 +245,14 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
 
   if (!engine.shouldRebalance(tick)) return;
   if (rebalancing) return;
+  if (Date.now() < rebalanceCooldownUntil) return;
 
   console.log("[rebalance] tick left active range — starting rebalance…");
   rebalancing = true;
 
   try {
-    // Ask AI for fresh spread before computing range (if enabled)
     if (StateManager.isAIEngineActive) {
-      await aiCronJob(priceInverted);
+      await analyzeVolatilityAndDecide(buildVolatilityData(priceInverted));
     }
 
     const newRange = engine.computeNewRange(tick, DEFAULT_RANGE_WIDTH);
@@ -230,6 +260,7 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
     // ----- DRY-RUN path -----
     if (POSITION_ID == null) {
       console.warn("[rebalance] DRY-RUN — simulating full 3-phase cycle");
+      writeSession("WITHDRAW", newRange);
       console.log(
         `[rebalance] new range would be [${newRange.tickLower}, ${newRange.tickUpper})`,
       );
@@ -247,6 +278,7 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
       );
 
       engine.updateRange(newRange);
+      clearSession();
       return;
     }
 
@@ -267,18 +299,52 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
       tickUpper: newRange.tickUpper,
       recipient: account.address,
       currentPrice: price,
-      slippageBps: 50,
+      slippageBps: 500,
     });
 
+    // Update tracked position to the newly minted NFT
+    setPositionId(result.newTokenId);
+    console.log(`[rebalance] tracking new NFT #${result.newTokenId}`);
+
     engine.updateRange(newRange);
+    clearSession();
+
+    // 15-second cooldown after success to avoid thrashing at range boundaries
+    rebalanceCooldownUntil = Date.now() + 15_000;
+
     console.log(
       `[rebalance] done — new range [${newRange.tickLower}, ${newRange.tickUpper})`,
     );
     console.log(
-      `[rebalance] withdraw: ${result.withdrawTx} | swap: ${result.swap.needed ? result.swap.txHash : "none"} | mint: ${result.mintTx}`,
+      `[rebalance] withdraw: ${result.withdrawTx ?? "skipped"} | swap: ${result.swap.needed ? result.swap.txHash : "none"} | mint: ${result.mintTx}`,
     );
-  } catch (err) {
+
+    void sendRebalanceReport({
+      price: priceInverted,
+      pairLabel: `${sym0}/${sym1}`,
+      tickLower: newRange.tickLower,
+      tickUpper: newRange.tickUpper,
+      feesCollected: {
+        symbol0: result.collected0.symbol,
+        amount0: result.collected0.formatted,
+        symbol1: result.collected1.symbol,
+        amount1: result.collected1.formatted,
+      },
+      wallet: {
+        symbol0: result.walletBal0.symbol,
+        amount0: result.walletBal0.formatted,
+        symbol1: result.walletBal1.symbol,
+        amount1: result.walletBal1.formatted,
+      },
+      withdrawTx: result.withdrawTx ?? "skipped",
+      mintTx: result.mintTx,
+      swapTx: result.swap.txHash,
+    });
+  } catch (err: unknown) {
     console.error("[rebalance] failed:", err);
+    void sendAlert(extractErrorSummary(err));
+    // 30-second cooldown after failure to prevent rapid-fire retries
+    rebalanceCooldownUntil = Date.now() + 30_000;
   } finally {
     rebalancing = false;
   }
@@ -301,14 +367,54 @@ async function main(): Promise<void> {
   observer.startPolling(onTick, POLL_INTERVAL_MS);
 }
 
-void main();
+void main().catch(async (err) => {
+  console.error("[fatal] unhandled error in main:", err);
+  await sendAlert(`FATAL — ${extractErrorSummary(err)}`).catch(() => {});
+  process.exit(1);
+});
 
+// ---------------------------------------------------------------------------
 // Graceful shutdown
-const shutdown = () => {
-  console.log("\n[shutdown] stopping…");
+// ---------------------------------------------------------------------------
+
+function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log("\n[shutdown] 准备安全下线...");
   observer.stopPolling();
-  stopAICron();
-  process.exit(0);
-};
+  clearSession();
+
+  const forceTimer = setTimeout(() => {
+    console.log("[shutdown] force exit (Telegram timeout)");
+    process.exit(0);
+  }, 5_000);
+  forceTimer.unref();
+
+  sendShutdownNotice()
+    .catch(() => {})
+    .finally(() => {
+      console.log("[shutdown] bye 🌸");
+      process.exit(0);
+    });
+}
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// ---------------------------------------------------------------------------
+// Global safety nets
+// ---------------------------------------------------------------------------
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+  void sendAlert(extractErrorSummary(reason));
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+  sendAlert(`UncaughtException — ${extractErrorSummary(err)}`)
+    .catch(() => {})
+    .finally(() => process.exit(1));
+  setTimeout(() => process.exit(1), 5_000).unref();
+});

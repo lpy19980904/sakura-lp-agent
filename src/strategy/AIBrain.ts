@@ -7,11 +7,14 @@ import { StateManager } from "./StateManager.js";
 // ---------------------------------------------------------------------------
 
 export interface VolatilityData {
+  pairLabel: string;
   high24h: number;
   low24h: number;
   currentPrice: number;
   atr: number;
   volatilityPct: number;
+  /** Number of data points in the price history. */
+  sampleCount: number;
 }
 
 interface AIResponse {
@@ -27,18 +30,27 @@ const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash-lite";
 
 function buildPrompt(data: VolatilityData): string {
-  return `你是一个专业的 DeFi 量化策略引擎。以下是目标资产过去 24 小时的价格特征数据：
-{
-  "high24h": ${data.high24h},
-  "low24h": ${data.low24h},
-  "currentPrice": ${data.currentPrice},
-  "atr": ${data.atr},
-  "volatilityPct": ${data.volatilityPct}
-}
+  const historyNote = data.sampleCount < 60
+    ? `\n注意：当前价格采样点仅 ${data.sampleCount} 个（不足 3 分钟），数据可能不充分，建议偏向保守（更宽区间）。`
+    : "";
 
-你的任务是判断当前属于低波动震荡市还是高波动趋势市，并给出一个 Uniswap V3 的区间宽度建议（Spread Multiplier）。
-- 震荡市：建议 0.5 到 1.0
-- 趋势市/极度波动：建议 1.5 到 3.0
+  return `你是一个专业的 DeFi 量化策略引擎，负责管理 Uniswap V3 上 ${data.pairLabel} 交易对的 LP 仓位。
+
+以下是该资产近期的价格特征数据：
+{
+  "pair": "${data.pairLabel}",
+  "high": ${data.high24h},
+  "low": ${data.low24h},
+  "currentPrice": ${data.currentPrice},
+  "atr": ${data.atr.toFixed(6)},
+  "volatilityPct": ${data.volatilityPct.toFixed(2)},
+  "sampleCount": ${data.sampleCount}
+}${historyNote}
+
+你的任务是判断当前属于低波动震荡市还是高波动趋势市，并给出一个区间宽度建议（Spread Multiplier）。
+- 震荡市（volatilityPct < 3%）：建议 0.5 到 1.0（窄区间，赚取更多手续费）
+- 中等波动（3%-8%）：建议 1.0 到 1.5
+- 趋势市/极度波动（>8%）：建议 1.5 到 3.0（宽区间，减少调仓频率）
 
 你必须且只能返回一段纯 JSON 格式的数据，不要包含任何 Markdown 标记（如 \`\`\`json），不要有任何解释性文字。格式严格如下：
 {"suggestedSpread": 1.2}`;
@@ -95,10 +107,15 @@ export async function analyzeVolatilityAndDecide(
   console.log("[AIBrain] querying Gemini for spread recommendation…");
 
   try {
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: buildPrompt(data),
-    });
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: MODEL,
+        contents: buildPrompt(data),
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Gemini timeout (5s)")), 5_000),
+      ),
+    ]);
 
     const text = response.text ?? "";
     console.log(`[AIBrain] raw response: ${text}`);

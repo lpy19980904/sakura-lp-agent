@@ -7,7 +7,7 @@ const FALLBACK_SPREAD = 1.0;
  */
 class _StateManager {
   /** Whether the AI engine is active (burns Gemini tokens). */
-  isAIEngineActive = false;
+  isAIEngineActive = true;
 
   /** Latest spread multiplier suggested by the AI (or fallback). */
   currentSpread = FALLBACK_SPREAD;

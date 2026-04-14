@@ -5,10 +5,12 @@ import {
   type Hash,
   encodeFunctionData,
   maxUint128,
+  parseEventLogs,
 } from "viem";
 import { nonfungiblePositionManagerAbi } from "../abi/NonfungiblePositionManager.js";
 import { CONTRACTS } from "../config/index.js";
 import { getTokenBalance, ensureApproval } from "../utils/tokens.js";
+import { writeSession } from "../utils/logger.js";
 import { Swapper, type SwapResult } from "./Swapper.js";
 
 export interface RebalanceParams {
@@ -25,11 +27,19 @@ export interface RebalanceParams {
 }
 
 export interface RebalanceResult {
-  withdrawTx: Hash;
+  withdrawTx: Hash | null;
   swap: SwapResult;
   mintTx: Hash;
+  /** The tokenId of the newly minted position NFT. */
+  newTokenId: bigint;
   amount0Used: bigint;
   amount1Used: bigint;
+  /** Post-withdraw balances (includes collected fees). */
+  collected0: { formatted: string; symbol: string };
+  collected1: { formatted: string; symbol: string };
+  /** Final wallet balances after mint. */
+  walletBal0: { formatted: string; symbol: string };
+  walletBal1: { formatted: string; symbol: string };
 }
 
 export class Rebalancer {
@@ -59,12 +69,16 @@ export class Rebalancer {
     const account = this.walletClient.account;
     if (!account) throw new Error("WalletClient has no account attached");
 
+    const targetRange = { tickLower: params.tickLower, tickUpper: params.tickUpper };
+
     // ======================= Phase 1: Withdraw =======================
     console.log("[Rebalancer] Phase 1/3: withdrawing liquidity…");
+    writeSession("WITHDRAW", targetRange);
     const withdrawTx = await this.withdraw(positionId, liquidity, account.address);
 
     // ======================= Phase 2: Swap to balance =================
     console.log("[Rebalancer] Phase 2/3: checking portfolio balance…");
+    writeSession("SWAP", targetRange);
     const [bal0Pre, bal1Pre] = await Promise.all([
       getTokenBalance(this.publicClient, params.token0, account.address),
       getTokenBalance(this.publicClient, params.token1, account.address),
@@ -82,42 +96,55 @@ export class Rebalancer {
 
     // ======================= Phase 3: Mint ============================
     console.log("[Rebalancer] Phase 3/3: minting new position…");
+    writeSession("MINT", targetRange);
 
-    // Re-read balances after the swap (or use pre-swap if no swap happened).
-    const [bal0, bal1] = swap.needed
-      ? await Promise.all([
-          getTokenBalance(this.publicClient, params.token0, account.address),
-          getTokenBalance(this.publicClient, params.token1, account.address),
-        ])
-      : [bal0Pre, bal1Pre];
+    const blockTag = swap.confirmedBlock
+      ? ({ blockNumber: swap.confirmedBlock } as const)
+      : undefined;
 
-    if (swap.needed) {
-      console.log(
-        `[Rebalancer] post-swap: ${bal0.formatted} ${bal0.symbol} / ${bal1.formatted} ${bal1.symbol}`,
-      );
+    const [bal0, bal1] = await Promise.all([
+      getTokenBalance(this.publicClient, params.token0, account.address, blockTag),
+      getTokenBalance(this.publicClient, params.token1, account.address, blockTag),
+    ]);
+
+    console.log(
+      `[Rebalancer] pre-mint: ${bal0.formatted} ${bal0.symbol} / ${bal1.formatted} ${bal1.symbol}`,
+    );
+
+    if (bal0.raw === 0n && bal1.raw === 0n) {
+      throw new Error("Both token balances are 0 — nothing to mint. Aborting.");
     }
 
-    // Ensure position manager is approved for both tokens.
     await Promise.all([
       ensureApproval(this.publicClient, this.walletClient, params.token0, this.positionManager, bal0.raw),
       ensureApproval(this.publicClient, this.walletClient, params.token1, this.positionManager, bal1.raw),
     ]);
 
-    const slippageBps = params.slippageBps ?? 50;
-    const mintTx = await this.mint({
+    const { hash: mintTx, newTokenId } = await this.mint({
       ...params,
       amount0Desired: bal0.raw,
       amount1Desired: bal1.raw,
-      amount0Min: bal0.raw - (bal0.raw * BigInt(slippageBps)) / 10_000n,
-      amount1Min: bal1.raw - (bal1.raw * BigInt(slippageBps)) / 10_000n,
+      amount0Min: 0n,
+      amount1Min: 0n,
     });
+
+    // Read final wallet balances for the report.
+    const [walBal0, walBal1] = await Promise.all([
+      getTokenBalance(this.publicClient, params.token0, account.address),
+      getTokenBalance(this.publicClient, params.token1, account.address),
+    ]);
 
     return {
       withdrawTx,
       swap,
       mintTx,
+      newTokenId,
       amount0Used: bal0.raw,
       amount1Used: bal1.raw,
+      collected0: { formatted: bal0Pre.formatted, symbol: bal0Pre.symbol },
+      collected1: { formatted: bal1Pre.formatted, symbol: bal1Pre.symbol },
+      walletBal0: { formatted: walBal0.formatted, symbol: walBal0.symbol },
+      walletBal1: { formatted: walBal1.formatted, symbol: walBal1.symbol },
     };
   }
 
@@ -129,7 +156,12 @@ export class Rebalancer {
     positionId: bigint,
     liquidity: bigint,
     recipient: Address,
-  ): Promise<Hash> {
+  ): Promise<Hash | null> {
+    if (liquidity === 0n) {
+      console.log("[Rebalancer] liquidity=0 — skipping withdraw (position already empty)");
+      return null;
+    }
+
     const account = this.walletClient.account!;
     const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
 
@@ -189,7 +221,7 @@ export class Rebalancer {
     amount0Min: bigint;
     amount1Min: bigint;
     recipient: Address;
-  }): Promise<Hash> {
+  }): Promise<{ hash: Hash; newTokenId: bigint }> {
     const account = this.walletClient.account!;
     const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
 
@@ -217,7 +249,37 @@ export class Rebalancer {
     });
 
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
-    console.log(`[Rebalancer] mint confirmed block ${receipt.blockNumber} — ${hash}`);
-    return hash;
+
+    // Extract new tokenId from ERC-721 Transfer(address,address,uint256) event
+    const transferAbi = [
+      {
+        type: "event" as const,
+        name: "Transfer",
+        inputs: [
+          { name: "from", type: "address", indexed: true },
+          { name: "to", type: "address", indexed: true },
+          { name: "tokenId", type: "uint256", indexed: true },
+        ],
+      },
+    ] as const;
+    const logs = parseEventLogs({
+      abi: transferAbi,
+      logs: receipt.logs,
+      eventName: "Transfer",
+    });
+    const mintTransfer = logs.find(
+      (l) => l.address.toLowerCase() === this.positionManager.toLowerCase(),
+    );
+    if (!mintTransfer) {
+      throw new Error(
+        `Mint tx ${hash} succeeded but no Transfer event found from NPM — cannot determine new tokenId. Check tx on explorer.`,
+      );
+    }
+    const newTokenId = mintTransfer.args.tokenId;
+
+    console.log(
+      `[Rebalancer] mint confirmed block ${receipt.blockNumber} — ${hash} (NFT #${newTokenId})`,
+    );
+    return { hash, newTokenId };
   }
 }

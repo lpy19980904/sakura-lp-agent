@@ -29,6 +29,8 @@ export interface SwapResult {
   needed: boolean;
   instruction: SwapInstruction | null;
   txHash: Hash | null;
+  /** Block number where the swap was confirmed (for reading post-swap state). */
+  confirmedBlock: bigint | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -47,8 +49,8 @@ export class Swapper {
     private readonly publicClient: PublicClient,
     /** Imbalance threshold (0–1). Swap triggers when one side > this ratio. */
     private readonly imbalanceThreshold = 0.6,
-    /** Swap slippage in basis points (default 100 = 1 %). */
-    private readonly slippageBps = 100,
+    /** Swap slippage in basis points (default 500 = 5 %). */
+    private readonly slippageBps = 500,
   ) {
     this.router = CONTRACTS.swapRouter;
   }
@@ -127,16 +129,15 @@ export class Swapper {
   }
 
   /**
-   * Execute a swap on-chain via the PancakeSwap V3 SwapRouter.
+   * Execute a swap on-chain via the Uniswap V3 SwapRouter02.
    */
   async executeSwap(
     instruction: SwapInstruction,
     fee: number,
-  ): Promise<Hash> {
+  ): Promise<{ hash: Hash; blockNumber: bigint }> {
     const account = this.walletClient.account;
     if (!account) throw new Error("WalletClient has no account attached");
 
-    // Ensure router is approved to spend tokenIn.
     await ensureApproval(
       this.publicClient,
       this.walletClient,
@@ -145,10 +146,9 @@ export class Swapper {
       instruction.amountIn,
     );
 
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
-    const minOut =
-      instruction.amountIn -
-      (instruction.amountIn * BigInt(this.slippageBps)) / 10_000n;
+    // estimatedOut is a float in the output token's units — use it for minOut.
+    const estOut = this.floatToBigInt(Number(instruction.estimatedOut), 18);
+    const minOut = estOut - (estOut * BigInt(this.slippageBps)) / 10_000n;
 
     const hash = await this.walletClient.writeContract({
       address: this.router,
@@ -160,7 +160,6 @@ export class Swapper {
           tokenOut: instruction.tokenOut,
           fee,
           recipient: account.address,
-          deadline,
           amountIn: instruction.amountIn,
           amountOutMinimum: minOut > 0n ? minOut : 0n,
           sqrtPriceLimitX96: 0n,
@@ -174,7 +173,7 @@ export class Swapper {
     console.log(
       `[Swapper] swap confirmed block ${receipt.blockNumber} — ${hash}`,
     );
-    return hash;
+    return { hash, blockNumber: receipt.blockNumber };
   }
 
   /**
@@ -190,15 +189,15 @@ export class Swapper {
 
     if (!instruction) {
       console.log("[Swapper] portfolio balanced — no swap needed");
-      return { needed: false, instruction: null, txHash: null };
+      return { needed: false, instruction: null, txHash: null, confirmedBlock: null };
     }
 
     console.log(
       `[Swapper] swapping ${instruction.formattedIn} ${instruction.symbolIn} → ~${instruction.estimatedOut} ${instruction.symbolOut}`,
     );
 
-    const txHash = await this.executeSwap(instruction, fee);
-    return { needed: true, instruction, txHash };
+    const { hash: txHash, blockNumber } = await this.executeSwap(instruction, fee);
+    return { needed: true, instruction, txHash, confirmedBlock: blockNumber };
   }
 
   // ---------------------------------------------------------------------------

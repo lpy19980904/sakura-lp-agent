@@ -19,18 +19,22 @@ export interface TokenBalance {
   symbol: string;
 }
 
-/** Read ERC-20 balance, decimals and symbol in a single multicall. */
+/** Read ERC-20 balance, decimals and symbol. Optional blockTag to read at a specific block. */
 export async function getTokenBalance(
   client: PublicClient,
   token: Address,
   owner: Address,
+  stateOverride?: { blockNumber: bigint },
 ): Promise<TokenBalance> {
+  const extra = stateOverride ? { blockNumber: stateOverride.blockNumber } : {};
+
   const [raw, decimals, symbol] = await Promise.all([
     client.readContract({
       address: token,
       abi: erc20Abi,
       functionName: "balanceOf",
       args: [owner],
+      ...extra,
     }),
     client.readContract({
       address: token,

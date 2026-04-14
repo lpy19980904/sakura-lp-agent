@@ -17,6 +17,14 @@ export const BSC_RPC_URL = requireEnv("BSC_RPC_URL");
 export const PRIVATE_KEY = requireEnv("PRIVATE_KEY") as `0x${string}`;
 export const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
 
+/** NFT position ID — null means DRY-RUN mode. Updated at runtime after rebalance. */
+export let POSITION_ID: bigint | null =
+  process.env.POSITION_ID ? BigInt(process.env.POSITION_ID) : null;
+
+export function setPositionId(id: bigint): void {
+  POSITION_ID = id;
+}
+
 // ---------------------------------------------------------------------------
 // Chain
 // ---------------------------------------------------------------------------
@@ -24,17 +32,14 @@ export const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
 export const chain = bsc;
 
 // ---------------------------------------------------------------------------
-// PancakeSwap V3 contract addresses (BSC mainnet)
+// Uniswap V3 contract addresses (BSC mainnet)
 // ---------------------------------------------------------------------------
 
 export const CONTRACTS = {
-  pancakeV3Factory: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+  uniswapV3Factory: "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
   nonfungiblePositionManager:
-    "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
-  swapRouter: "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
-  quoterV2: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
-  tickLens: "0x9a489505a00cE272eAa5e07Dba6491314CaE3796",
-  smartRouterV3: "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",
+    "0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613",
+  swapRouter: "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",
 } as const;
 
 // ---------------------------------------------------------------------------
