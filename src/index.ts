@@ -76,6 +76,75 @@ const rebalancer = new Rebalancer(walletClient, publicClient);
 const swapper = new Swapper(walletClient, publicClient);
 
 // ---------------------------------------------------------------------------
+// Auto-discover active position from on-chain NFTs
+// ---------------------------------------------------------------------------
+
+/**
+ * Scan all position NFTs owned by this wallet, find the one that:
+ *  1. Matches our target pool (token0, token1, fee)
+ *  2. Has the highest liquidity (> 0)
+ * Returns the tokenId or null if none found.
+ */
+async function discoverActivePosition(): Promise<bigint | null> {
+  const npm = CONTRACTS.nonfungiblePositionManager;
+  const nftCount = await publicClient.readContract({
+    address: npm,
+    abi: nonfungiblePositionManagerAbi,
+    functionName: "balanceOf",
+    args: [account.address],
+  });
+
+  if (nftCount === 0n) return null;
+
+  console.log(`[discover] wallet holds ${nftCount} position NFT(s) — scanning…`);
+
+  let bestId: bigint | null = null;
+  let bestLiquidity = 0n;
+
+  for (let i = 0n; i < nftCount; i++) {
+    const tokenId = await publicClient.readContract({
+      address: npm,
+      abi: nonfungiblePositionManagerAbi,
+      functionName: "tokenOfOwnerByIndex",
+      args: [account.address, i],
+    });
+
+    const pos = await publicClient.readContract({
+      address: npm,
+      abi: nonfungiblePositionManagerAbi,
+      functionName: "positions",
+      args: [tokenId],
+    });
+
+    const posToken0 = (pos[2] as string).toLowerCase();
+    const posToken1 = (pos[3] as string).toLowerCase();
+    const posFee = pos[4];
+    const posLiquidity = pos[7];
+
+    const matchesPool =
+      posToken0 === TOKEN0.toLowerCase() &&
+      posToken1 === TOKEN1.toLowerCase() &&
+      posFee === FEE_TIER;
+
+    if (matchesPool && posLiquidity > bestLiquidity) {
+      bestId = tokenId;
+      bestLiquidity = posLiquidity;
+    }
+
+    console.log(
+      `[discover]   #${tokenId} pool=${posToken0.slice(0, 6)}…/${posToken1.slice(0, 6)}… fee=${posFee} liq=${posLiquidity}${matchesPool ? " ← target pool" : ""}`,
+    );
+  }
+
+  if (bestId !== null) {
+    console.log(`[discover] selected #${bestId} (liquidity=${bestLiquidity})`);
+  } else {
+    console.log("[discover] no active position found for target pool");
+  }
+  return bestId;
+}
+
+// ---------------------------------------------------------------------------
 // Price history ring buffer (for AI volatility input)
 // ---------------------------------------------------------------------------
 
@@ -166,8 +235,15 @@ async function preflight(): Promise<void> {
   console.log(`pair     : ${sym0}/${sym1}`);
   console.log(`balances : ${bal0.formatted} ${sym0} / ${bal1.formatted} ${sym1}`);
 
+  // Auto-discover the active position from on-chain NFTs.
+  // Falls back to POSITION_ID env var only if discovery finds nothing.
+  const discovered = await discoverActivePosition();
+  if (discovered !== null) {
+    setPositionId(discovered);
+  }
+
   if (POSITION_ID == null) {
-    console.log("mode     : DRY-RUN (no POSITION_ID — rebalance will be simulated)");
+    console.log("mode     : DRY-RUN (no active position found — rebalance will be simulated)");
   } else {
     console.log(`position : #${POSITION_ID}`);
 

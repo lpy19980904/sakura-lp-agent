@@ -102,6 +102,23 @@ export const nonfungiblePositionManagerAbi = [
     inputs: [{ name: "data", type: "bytes[]" }],
     outputs: [{ name: "results", type: "bytes[]" }],
   },
+  {
+    name: "balanceOf",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "owner", type: "address" }],
+    outputs: [{ name: "balance", type: "uint256" }],
+  },
+  {
+    name: "tokenOfOwnerByIndex",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "index", type: "uint256" },
+    ],
+    outputs: [{ name: "tokenId", type: "uint256" }],
+  },
 ] as const;
 
 // ---------------------------------------------------------------------------
