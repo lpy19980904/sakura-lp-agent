@@ -19,6 +19,7 @@ import {
   POSITION_ID,
   setPositionId,
   MIN_MINT_DEPLOYED_TO_WALLET_RATIO,
+  STALE_POSITION_IDS,
 } from "./config/index.js";
 import { PoolObserver, type Slot0Snapshot } from "./monitor/PoolObserver.js";
 import { RangeEngine } from "./strategy/RangeEngine.js";
@@ -364,6 +365,107 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Stale position consolidation (runs once on boot)
+// ---------------------------------------------------------------------------
+
+async function consolidateStalePositions(): Promise<void> {
+  if (STALE_POSITION_IDS.length === 0) return;
+
+  console.log(
+    `\n[consolidate] found ${STALE_POSITION_IDS.length} stale position(s) to clean up: ${STALE_POSITION_IDS.map(String).join(", ")}`,
+  );
+
+  for (const id of STALE_POSITION_IDS) {
+    try {
+      const tx = await rebalancer.withdrawPosition(id, account.address);
+      console.log(`[consolidate] #${id} withdrawn — tx: ${tx ?? "nothing to collect"}`);
+    } catch (err) {
+      console.error(`[consolidate] #${id} withdraw failed:`, err);
+      void sendAlert(`Consolidate: failed to withdraw #${id} — ${extractErrorSummary(err)}`);
+    }
+  }
+
+  const [bal0, bal1] = await Promise.all([
+    getTokenBalance(publicClient, TOKEN0, account.address),
+    getTokenBalance(publicClient, TOKEN1, account.address),
+  ]);
+  console.log(
+    `[consolidate] wallet after withdrawals: ${bal0.formatted} ${bal0.symbol} / ${bal1.formatted} ${bal1.symbol}`,
+  );
+
+  if (bal0.raw === 0n && bal1.raw === 0n) {
+    console.warn("[consolidate] wallet is empty after withdrawals — nothing to mint");
+    return;
+  }
+
+  const snapshot = await observer.getCurrentTick();
+  const { tick, price } = snapshot;
+  console.log(`[consolidate] current tick=${tick} price=${price.toFixed(6)}`);
+
+  const swapResult = await swapper.balancePortfolio(bal0, bal1, price, FEE_TIER);
+
+  const [bal0Post, bal1Post] = await Promise.all([
+    getTokenBalance(publicClient, TOKEN0, account.address),
+    getTokenBalance(publicClient, TOKEN1, account.address),
+  ]);
+  console.log(
+    `[consolidate] wallet after swap: ${bal0Post.formatted} ${bal0Post.symbol} / ${bal1Post.formatted} ${bal1Post.symbol}`,
+  );
+
+  const newRange = engine.computeNewRange(tick, DEFAULT_RANGE_WIDTH);
+  console.log(`[consolidate] minting new position at [${newRange.tickLower}, ${newRange.tickUpper})`);
+
+  const pm = CONTRACTS.nonfungiblePositionManager;
+  await ensureApproval(publicClient, walletClient, TOKEN0, pm, bal0Post.raw);
+  await ensureApproval(publicClient, walletClient, TOKEN1, pm, bal1Post.raw);
+
+  const result = await rebalancer.execute(0n, 0n, {
+    token0: TOKEN0,
+    token1: TOKEN1,
+    fee: FEE_TIER,
+    tickLower: newRange.tickLower,
+    tickUpper: newRange.tickUpper,
+    recipient: account.address,
+    currentPrice: price,
+    slippageBps: 500,
+    minMintDeployedToWalletRatio: 0,
+  });
+
+  if (result.mintTx) {
+    setPositionId(result.newTokenId);
+    engine.updateRange(newRange);
+    console.log(
+      `[consolidate] done — new NFT #${result.newTokenId} at [${newRange.tickLower}, ${newRange.tickUpper})`,
+    );
+    console.log(`[consolidate] mint tx: ${result.mintTx}`);
+
+    void sendRebalanceReport({
+      price: snapshot.priceInverted,
+      pairLabel: `${sym0}/${sym1}`,
+      tickLower: newRange.tickLower,
+      tickUpper: newRange.tickUpper,
+      feesCollected: {
+        symbol0: result.collected0.symbol,
+        amount0: result.collected0.formatted,
+        symbol1: result.collected1.symbol,
+        amount1: result.collected1.formatted,
+      },
+      wallet: {
+        symbol0: result.walletBal0.symbol,
+        amount0: result.walletBal0.formatted,
+        symbol1: result.walletBal1.symbol,
+        amount1: result.walletBal1.formatted,
+      },
+      withdrawTx: `consolidated ${STALE_POSITION_IDS.length} stale positions`,
+      mintTx: result.mintTx,
+      swapTx: swapResult.txHash,
+    });
+  } else {
+    console.warn("[consolidate] mint was skipped — no new position created");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -375,6 +477,7 @@ async function main(): Promise<void> {
   console.log(`interval : ${POLL_INTERVAL_MS} ms`);
 
   await preflight();
+  await consolidateStalePositions();
 
   setupHotkeyListener();
   observer.startPolling(onTick, POLL_INTERVAL_MS);

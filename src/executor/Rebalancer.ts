@@ -235,6 +235,33 @@ export class Rebalancer {
   }
 
   // ---------------------------------------------------------------------------
+  // Public: withdraw a single position (reads liquidity from chain).
+  // Used by the stale-position consolidation flow.
+  // ---------------------------------------------------------------------------
+
+  async withdrawPosition(
+    positionId: bigint,
+    recipient: Address,
+  ): Promise<Hash | null> {
+    const position = await this.publicClient.readContract({
+      address: this.positionManager,
+      abi: nonfungiblePositionManagerAbi,
+      functionName: "positions",
+      args: [positionId],
+    });
+    const liquidity = position[7];
+
+    if (liquidity > 0n) {
+      console.log(`[Rebalancer] withdrawPosition #${positionId} — liquidity=${liquidity}`);
+      return this.withdraw(positionId, liquidity, recipient);
+    }
+
+    // liquidity=0 but there may be uncollected fees — sweep them.
+    console.log(`[Rebalancer] withdrawPosition #${positionId} — liquidity=0, collecting residual fees`);
+    return this.collectOnly(positionId, recipient);
+  }
+
+  // ---------------------------------------------------------------------------
   // Phase 1: decreaseLiquidity + collect
   // ---------------------------------------------------------------------------
 
@@ -289,6 +316,32 @@ export class Rebalancer {
 
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
     console.log(`[Rebalancer] withdraw confirmed block ${receipt.blockNumber} — ${hash}`);
+    return hash;
+  }
+
+  /** Collect any uncollected fees from a position that already has 0 liquidity. */
+  private async collectOnly(
+    positionId: bigint,
+    recipient: Address,
+  ): Promise<Hash | null> {
+    const account = this.walletClient.account!;
+    const hash = await this.walletClient.writeContract({
+      address: this.positionManager,
+      abi: nonfungiblePositionManagerAbi,
+      functionName: "collect",
+      args: [
+        {
+          tokenId: positionId,
+          recipient,
+          amount0Max: maxUint128,
+          amount1Max: maxUint128,
+        },
+      ],
+      chain: this.publicClient.chain,
+      account,
+    });
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+    console.log(`[Rebalancer] collect confirmed block ${receipt.blockNumber} — ${hash}`);
     return hash;
   }
 

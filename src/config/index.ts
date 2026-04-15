@@ -67,6 +67,21 @@ export const DEFAULT_RANGE_WIDTH = 10;
  * deposit (amount0+amount1 valued in token1) is below this fraction of the
  * pre-mint wallet total (same valuation). Set to 0 to disable. Default 0.05 = 5%.
  */
+/**
+ * Comma-separated list of NFT position IDs to withdraw & consolidate on boot.
+ * Example: STALE_POSITION_IDS=1764367,1764365,1764209
+ * Empty or unset = no cleanup.
+ */
+export const STALE_POSITION_IDS: bigint[] = (() => {
+  const raw = process.env.STALE_POSITION_IDS;
+  if (!raw || raw.trim() === "") return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map((s) => BigInt(s));
+})();
+
 export const MIN_MINT_DEPLOYED_TO_WALLET_RATIO = (() => {
   const raw = process.env.MIN_MINT_DEPLOYED_TO_WALLET_RATIO;
   if (raw === undefined || raw === "") return 0.05;
