@@ -375,9 +375,12 @@ async function consolidateStalePositions(): Promise<void> {
     `\n[consolidate] found ${STALE_POSITION_IDS.length} stale position(s) to clean up: ${STALE_POSITION_IDS.map(String).join(", ")}`,
   );
 
+  // Phase A: withdraw all stale positions → tokens return to wallet
+  const withdrawTxs: string[] = [];
   for (const id of STALE_POSITION_IDS) {
     try {
       const tx = await rebalancer.withdrawPosition(id, account.address);
+      withdrawTxs.push(`#${id}: ${tx ?? "empty"}`);
       console.log(`[consolidate] #${id} withdrawn — tx: ${tx ?? "nothing to collect"}`);
     } catch (err) {
       console.error(`[consolidate] #${id} withdraw failed:`, err);
@@ -398,70 +401,64 @@ async function consolidateStalePositions(): Promise<void> {
     return;
   }
 
+  // Phase B: swap + mint via rebalancer.execute (pass liquidity=0 so Phase 1
+  // inside execute is a no-op; execute handles swap-to-balance → mint itself).
   const snapshot = await observer.getCurrentTick();
   const { tick, price } = snapshot;
   console.log(`[consolidate] current tick=${tick} price=${price.toFixed(6)}`);
 
-  const swapResult = await swapper.balancePortfolio(bal0, bal1, price, FEE_TIER);
-
-  const [bal0Post, bal1Post] = await Promise.all([
-    getTokenBalance(publicClient, TOKEN0, account.address),
-    getTokenBalance(publicClient, TOKEN1, account.address),
-  ]);
-  console.log(
-    `[consolidate] wallet after swap: ${bal0Post.formatted} ${bal0Post.symbol} / ${bal1Post.formatted} ${bal1Post.symbol}`,
-  );
-
   const newRange = engine.computeNewRange(tick, DEFAULT_RANGE_WIDTH);
-  console.log(`[consolidate] minting new position at [${newRange.tickLower}, ${newRange.tickUpper})`);
+  console.log(`[consolidate] target range [${newRange.tickLower}, ${newRange.tickUpper})`);
 
-  const pm = CONTRACTS.nonfungiblePositionManager;
-  await ensureApproval(publicClient, walletClient, TOKEN0, pm, bal0Post.raw);
-  await ensureApproval(publicClient, walletClient, TOKEN1, pm, bal1Post.raw);
-
-  const result = await rebalancer.execute(0n, 0n, {
-    token0: TOKEN0,
-    token1: TOKEN1,
-    fee: FEE_TIER,
-    tickLower: newRange.tickLower,
-    tickUpper: newRange.tickUpper,
-    recipient: account.address,
-    currentPrice: price,
-    slippageBps: 500,
-    minMintDeployedToWalletRatio: 0,
-  });
-
-  if (result.mintTx) {
-    setPositionId(result.newTokenId);
-    engine.updateRange(newRange);
-    console.log(
-      `[consolidate] done — new NFT #${result.newTokenId} at [${newRange.tickLower}, ${newRange.tickUpper})`,
-    );
-    console.log(`[consolidate] mint tx: ${result.mintTx}`);
-
-    void sendRebalanceReport({
-      price: snapshot.priceInverted,
-      pairLabel: `${sym0}/${sym1}`,
+  try {
+    const result = await rebalancer.execute(0n, 0n, {
+      token0: TOKEN0,
+      token1: TOKEN1,
+      fee: FEE_TIER,
       tickLower: newRange.tickLower,
       tickUpper: newRange.tickUpper,
-      feesCollected: {
-        symbol0: result.collected0.symbol,
-        amount0: result.collected0.formatted,
-        symbol1: result.collected1.symbol,
-        amount1: result.collected1.formatted,
-      },
-      wallet: {
-        symbol0: result.walletBal0.symbol,
-        amount0: result.walletBal0.formatted,
-        symbol1: result.walletBal1.symbol,
-        amount1: result.walletBal1.formatted,
-      },
-      withdrawTx: `consolidated ${STALE_POSITION_IDS.length} stale positions`,
-      mintTx: result.mintTx,
-      swapTx: swapResult.txHash,
+      recipient: account.address,
+      currentPrice: price,
+      slippageBps: 500,
+      minMintDeployedToWalletRatio: 0,
     });
-  } else {
-    console.warn("[consolidate] mint was skipped — no new position created");
+
+    if (result.mintTx) {
+      setPositionId(result.newTokenId);
+      engine.updateRange(newRange);
+      console.log(
+        `[consolidate] done — new NFT #${result.newTokenId} at [${newRange.tickLower}, ${newRange.tickUpper})`,
+      );
+      console.log(`[consolidate] mint tx: ${result.mintTx}`);
+
+      void sendRebalanceReport({
+        price: snapshot.priceInverted,
+        pairLabel: `${sym0}/${sym1}`,
+        tickLower: newRange.tickLower,
+        tickUpper: newRange.tickUpper,
+        feesCollected: {
+          symbol0: result.collected0.symbol,
+          amount0: result.collected0.formatted,
+          symbol1: result.collected1.symbol,
+          amount1: result.collected1.formatted,
+        },
+        wallet: {
+          symbol0: result.walletBal0.symbol,
+          amount0: result.walletBal0.formatted,
+          symbol1: result.walletBal1.symbol,
+          amount1: result.walletBal1.formatted,
+        },
+        withdrawTx: withdrawTxs.join(" | "),
+        mintTx: result.mintTx,
+        swapTx: result.swap.txHash,
+      });
+    } else {
+      console.error("[consolidate] mint was skipped — funds stuck in wallet!");
+      void sendAlert("Consolidation: mint was skipped after withdrawing stale positions. Funds are in wallet.");
+    }
+  } catch (err) {
+    console.error("[consolidate] swap+mint failed:", err);
+    void sendAlert(`Consolidation swap+mint failed — ${extractErrorSummary(err)}`);
   }
 }
 
