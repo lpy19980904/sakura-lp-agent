@@ -18,6 +18,7 @@ import {
   DEFAULT_RANGE_WIDTH,
   POSITION_ID,
   setPositionId,
+  MIN_MINT_DEPLOYED_TO_WALLET_RATIO,
 } from "./config/index.js";
 import { PoolObserver, type Slot0Snapshot } from "./monitor/PoolObserver.js";
 import { RangeEngine } from "./strategy/RangeEngine.js";
@@ -300,11 +301,17 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
       recipient: account.address,
       currentPrice: price,
       slippageBps: 500,
+      minMintDeployedToWalletRatio: MIN_MINT_DEPLOYED_TO_WALLET_RATIO,
     });
 
-    // Update tracked position to the newly minted NFT
-    setPositionId(result.newTokenId);
-    console.log(`[rebalance] tracking new NFT #${result.newTokenId}`);
+    if (!result.mintSkipped) {
+      setPositionId(result.newTokenId);
+      console.log(`[rebalance] tracking new NFT #${result.newTokenId}`);
+    } else {
+      console.warn(
+        `[rebalance] mint skipped (deposit < ${(MIN_MINT_DEPLOYED_TO_WALLET_RATIO * 100).toFixed(1)}% of wallet) — still on NFT #${POSITION_ID}`,
+      );
+    }
 
     engine.updateRange(newRange);
     clearSession();
@@ -316,7 +323,7 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
       `[rebalance] done — new range [${newRange.tickLower}, ${newRange.tickUpper})`,
     );
     console.log(
-      `[rebalance] withdraw: ${result.withdrawTx ?? "skipped"} | swap: ${result.swap.needed ? result.swap.txHash : "none"} | mint: ${result.mintTx}`,
+      `[rebalance] withdraw: ${result.withdrawTx ?? "skipped"} | swap: ${result.swap.needed ? result.swap.txHash : "none"} | mint: ${result.mintTx ?? "skipped"}`,
     );
 
     void sendRebalanceReport({
@@ -337,7 +344,9 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
         amount1: result.walletBal1.formatted,
       },
       withdrawTx: result.withdrawTx ?? "skipped",
-      mintTx: result.mintTx,
+      mintTx:
+        result.mintTx ??
+        `skipped (simulated deposit < ${(MIN_MINT_DEPLOYED_TO_WALLET_RATIO * 100).toFixed(0)}% of wallet)`,
       swapTx: result.swap.txHash,
     });
   } catch (err: unknown) {

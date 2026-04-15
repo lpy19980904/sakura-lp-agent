@@ -61,3 +61,16 @@ export const POLL_INTERVAL_MS = 3_000;
 
 /** Default tick-spacing width for narrow range strategy (in tick-spacing units). */
 export const DEFAULT_RANGE_WIDTH = 10;
+
+/**
+ * Skip opening a new LP position after rebalance when the simulated on-chain mint
+ * deposit (amount0+amount1 valued in token1) is below this fraction of the
+ * pre-mint wallet total (same valuation). Set to 0 to disable. Default 0.05 = 5%.
+ */
+export const MIN_MINT_DEPLOYED_TO_WALLET_RATIO = (() => {
+  const raw = process.env.MIN_MINT_DEPLOYED_TO_WALLET_RATIO;
+  if (raw === undefined || raw === "") return 0.05;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, 0.99);
+})();
