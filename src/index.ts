@@ -304,14 +304,18 @@ async function onTick(snapshot: Slot0Snapshot): Promise<void> {
       minMintDeployedToWalletRatio: MIN_MINT_DEPLOYED_TO_WALLET_RATIO,
     });
 
-    if (!result.mintSkipped) {
-      setPositionId(result.newTokenId);
-      console.log(`[rebalance] tracking new NFT #${result.newTokenId}`);
-    } else {
+    if (result.mintSkipped) {
       console.warn(
-        `[rebalance] mint skipped (deposit < ${(MIN_MINT_DEPLOYED_TO_WALLET_RATIO * 100).toFixed(1)}% of wallet) — still on NFT #${POSITION_ID}`,
+        `[rebalance] mint skipped (deposit < ${(MIN_MINT_DEPLOYED_TO_WALLET_RATIO * 100).toFixed(1)}% of wallet) — funds left in wallet, NOT updating range`,
       );
+      clearSession();
+      // Long cooldown: no point retrying quickly when the amounts are dust.
+      rebalanceCooldownUntil = Date.now() + 300_000; // 5 min
+      return;
     }
+
+    setPositionId(result.newTokenId);
+    console.log(`[rebalance] tracking new NFT #${result.newTokenId}`);
 
     engine.updateRange(newRange);
     clearSession();

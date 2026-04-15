@@ -123,82 +123,88 @@ export class Rebalancer {
       throw new Error("Both token balances are 0 — nothing to mint. Aborting.");
     }
 
-    const minRatio = params.minMintDeployedToWalletRatio ?? 0;
-    const preMintWalletToken1 = portfolioValueToken1(
-      bal0.raw,
-      bal1.raw,
-      bal0.decimals,
-      bal1.decimals,
-      params.currentPrice,
-    );
-
-    let mintSkipped = false;
-    if (minRatio > 0 && preMintWalletToken1 > 0) {
-      const previewDeadline = BigInt(Math.floor(Date.now() / 1000) + 600);
-      const { result: mintPreview } = await this.publicClient.simulateContract({
-        address: this.positionManager,
-        abi: nonfungiblePositionManagerAbi,
-        functionName: "mint",
-        args: [
-          {
-            token0: params.token0,
-            token1: params.token1,
-            fee: params.fee,
-            tickLower: params.tickLower,
-            tickUpper: params.tickUpper,
-            amount0Desired: bal0.raw,
-            amount1Desired: bal1.raw,
-            amount0Min: 0n,
-            amount1Min: 0n,
-            recipient: params.recipient,
-            deadline: previewDeadline,
-          },
-        ],
-        account,
-      });
-      const [, , simAmount0, simAmount1] = mintPreview;
-
-      const deployedToken1 = portfolioValueToken1(
-        simAmount0,
-        simAmount1,
-        bal0.decimals,
-        bal1.decimals,
-        params.currentPrice,
-      );
-      const threshold = preMintWalletToken1 * minRatio;
-      if (deployedToken1 < threshold) {
-        console.log(
-          `[Rebalancer] mint skipped — simulated deposit ≈${deployedToken1.toFixed(4)} (token1) ` +
-            `< ${(minRatio * 100).toFixed(1)}% of pre-mint wallet ≈${preMintWalletToken1.toFixed(4)} (token1)`,
-        );
-        mintSkipped = true;
-      }
-    }
-
-    if (mintSkipped) {
-      const [walBal0, walBal1] = await Promise.all([
-        getTokenBalance(this.publicClient, params.token0, account.address),
-        getTokenBalance(this.publicClient, params.token1, account.address),
-      ]);
-      return {
-        withdrawTx,
-        swap,
-        mintTx: null,
-        newTokenId: positionId,
-        mintSkipped: true,
-        amount0Used: 0n,
-        amount1Used: 0n,
-        collected0: { formatted: bal0Pre.formatted, symbol: bal0Pre.symbol },
-        collected1: { formatted: bal1Pre.formatted, symbol: bal1Pre.symbol },
-        walletBal0: { formatted: walBal0.formatted, symbol: walBal0.symbol },
-        walletBal1: { formatted: walBal1.formatted, symbol: walBal1.symbol },
-      };
-    }
-
     await Promise.all([
       ensureApproval(this.publicClient, this.walletClient, params.token0, this.positionManager, bal0.raw),
       ensureApproval(this.publicClient, this.walletClient, params.token1, this.positionManager, bal1.raw),
     ]);
+
+    const minRatio = params.minMintDeployedToWalletRatio ?? 0;
+    if (minRatio > 0) {
+      const preMintWalletToken1 = portfolioValueToken1(
+        bal0.raw,
+        bal1.raw,
+        bal0.decimals,
+        bal1.decimals,
+        params.currentPrice,
+      );
+
+      if (preMintWalletToken1 > 0) {
+        let mintSkipped = false;
+        try {
+          const previewDeadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+          const { result: mintPreview } = await this.publicClient.simulateContract({
+            address: this.positionManager,
+            abi: nonfungiblePositionManagerAbi,
+            functionName: "mint",
+            args: [
+              {
+                token0: params.token0,
+                token1: params.token1,
+                fee: params.fee,
+                tickLower: params.tickLower,
+                tickUpper: params.tickUpper,
+                amount0Desired: bal0.raw,
+                amount1Desired: bal1.raw,
+                amount0Min: 0n,
+                amount1Min: 0n,
+                recipient: params.recipient,
+                deadline: previewDeadline,
+              },
+            ],
+            account,
+          });
+          const [, , simAmount0, simAmount1] = mintPreview;
+
+          const deployedToken1 = portfolioValueToken1(
+            simAmount0,
+            simAmount1,
+            bal0.decimals,
+            bal1.decimals,
+            params.currentPrice,
+          );
+          const threshold = preMintWalletToken1 * minRatio;
+          if (deployedToken1 < threshold) {
+            console.log(
+              `[Rebalancer] mint skipped — simulated deposit ≈${deployedToken1.toFixed(4)} (token1) ` +
+                `< ${(minRatio * 100).toFixed(1)}% of pre-mint wallet ≈${preMintWalletToken1.toFixed(4)} (token1)`,
+            );
+            mintSkipped = true;
+          }
+        } catch (err) {
+          console.warn("[Rebalancer] simulateContract(mint) failed — proceeding with mint anyway:", err);
+        }
+
+        if (mintSkipped) {
+          const [walBal0, walBal1] = await Promise.all([
+            getTokenBalance(this.publicClient, params.token0, account.address),
+            getTokenBalance(this.publicClient, params.token1, account.address),
+          ]);
+          return {
+            withdrawTx,
+            swap,
+            mintTx: null,
+            newTokenId: positionId,
+            mintSkipped: true,
+            amount0Used: 0n,
+            amount1Used: 0n,
+            collected0: { formatted: bal0Pre.formatted, symbol: bal0Pre.symbol },
+            collected1: { formatted: bal1Pre.formatted, symbol: bal1Pre.symbol },
+            walletBal0: { formatted: walBal0.formatted, symbol: walBal0.symbol },
+            walletBal1: { formatted: walBal1.formatted, symbol: walBal1.symbol },
+          };
+        }
+      }
+    }
 
     const { hash: mintTx, newTokenId } = await this.mint({
       ...params,
